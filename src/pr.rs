@@ -1271,6 +1271,13 @@ fn map_repo_error(error: RepoError) -> CommandError {
                 "remote request returned unexpected status: {status}"
             )),
         },
+        RepoError::UnexpectedStatusWithMessage(status, message) => CommandError {
+            code: EXIT_REMOTE,
+            stdout: None,
+            stderr: Some(format!(
+                "remote request failed ({status}): {message}"
+            )),
+        },
         RepoError::NotFound => CommandError::not_found("repository not found"),
     }
 }

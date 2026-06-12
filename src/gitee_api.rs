@@ -29,6 +29,14 @@ pub struct MergePullRequest<'a> {
     pub merge_method: &'a str,
 }
 
+pub struct CreateRepositoryParams<'a> {
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub homepage: Option<&'a str>,
+    pub private: bool,
+    pub auto_init: bool,
+}
+
 pub struct UpdatePullRequest<'a> {
     pub title: Option<&'a str>,
     pub body: Option<&'a str>,
@@ -675,6 +683,88 @@ impl GiteeClient {
 
         Err(PullRequestError::UnexpectedStatus(status))
     }
+
+    pub fn create_repository(
+        &self,
+        token: &str,
+        params: &CreateRepositoryParams<'_>,
+    ) -> Result<Repository, RepoError> {
+        let mut form = vec![
+            ("access_token", token.to_string()),
+            ("name", params.name.to_string()),
+        ];
+
+        if let Some(description) = params.description {
+            form.push(("description", description.to_string()));
+        }
+        if let Some(homepage) = params.homepage {
+            form.push(("homepage", homepage.to_string()));
+        }
+        form.push(("private", params.private.to_string()));
+        form.push(("auto_init", params.auto_init.to_string()));
+
+        let response = self
+            .client
+            .post(format!("{}/v5/user/repos", self.base_url))
+            .form(&form)
+            .send()
+            .map_err(RepoError::Transport)?;
+
+        if response.status().is_success() {
+            let repository = response
+                .json::<RepositoryResponse>()
+                .map_err(RepoError::Transport)?;
+            return Ok(repository.into_repository());
+        }
+
+        let status = response.status().as_u16();
+        let error_message = parse_api_error_message(response);
+
+        if status == 401 {
+            return Err(RepoError::InvalidToken);
+        }
+
+        if let Some(message) = error_message {
+            return Err(RepoError::UnexpectedStatusWithMessage(status, message));
+        }
+
+        Err(RepoError::UnexpectedStatus(status))
+    }
+
+    pub fn delete_repository(
+        &self,
+        owner: &str,
+        repo: &str,
+        token: &str,
+    ) -> Result<(), RepoError> {
+        let response = self
+            .client
+            .delete(format!("{}/v5/repos/{owner}/{repo}", self.base_url))
+            .query(&[("access_token", token)])
+            .send()
+            .map_err(RepoError::Transport)?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status().as_u16();
+        let error_message = parse_api_error_message(response);
+
+        if matches!(status, 400 | 401) {
+            return Err(RepoError::InvalidToken);
+        }
+
+        if status == 404 {
+            return Err(RepoError::NotFound);
+        }
+
+        if let Some(message) = error_message {
+            return Err(RepoError::UnexpectedStatusWithMessage(status, message));
+        }
+
+        Err(RepoError::UnexpectedStatus(status))
+    }
 }
 
 fn resolve_base_url(value: Option<String>) -> String {
@@ -695,6 +785,7 @@ pub enum RepoError {
     NotFound,
     Transport(reqwest::Error),
     UnexpectedStatus(u16),
+    UnexpectedStatusWithMessage(u16, String),
 }
 
 pub enum IssueError {

@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::command::{CommandError, CommandOutcome, EXIT_GIT, EXIT_OK, EXIT_REMOTE, OutputFormat};
 use crate::config::{CloneProtocol, ConfigStore};
-use crate::gitee_api::{GiteeClient, RepoError, Repository};
+use crate::gitee_api::{CreateRepositoryParams, GiteeClient, RepoError, Repository};
 use crate::repo_context::infer_repo_context;
 
 pub struct RepoService {
@@ -113,6 +113,55 @@ impl RepoService {
         ))
     }
 
+    pub fn new_repo(&self, request: RepoNewRequest) -> Result<CommandOutcome, CommandError> {
+        let token = self
+            .config
+            .load_runtime_token()
+            .map_err(CommandError::config)?
+            .map(|resolved| resolved.token)
+            .ok_or_else(|| {
+                CommandError::usage("repo new requires authentication; run `gitee auth login` first")
+            })?;
+
+        let repository = self
+            .client
+            .create_repository(
+                &token,
+                &CreateRepositoryParams {
+                    name: &request.name,
+                    description: request.description.as_deref(),
+                    homepage: request.homepage.as_deref(),
+                    private: request.private,
+                    auto_init: request.auto_init,
+                },
+            )
+            .map_err(map_repo_error)?;
+
+        Ok(render_repo_new(request.output, &repository))
+    }
+
+    pub fn del_repo(&self, request: RepoDeleteRequest) -> Result<CommandOutcome, CommandError> {
+        let slug = RepoSlug::parse(&request.repo)?;
+        let token = self
+            .config
+            .load_runtime_token()
+            .map_err(CommandError::config)?
+            .map(|resolved| resolved.token)
+            .ok_or_else(|| {
+                CommandError::usage("repo del requires authentication; run `gitee auth login` first")
+            })?;
+
+        if !request.yes {
+            prompt_for_repo_deletion_confirmation(&slug.owner, &slug.name)?;
+        }
+
+        self.client
+            .delete_repository(&slug.owner, &slug.name, &token)
+            .map_err(map_repo_error)?;
+
+        Ok(render_repo_delete(request.output, &slug.owner, &slug.name))
+    }
+
     fn resolve_clone_transport(
         &self,
         requested: Option<CloneTransport>,
@@ -148,6 +197,21 @@ pub struct RepoCloneRequest {
     pub repo: String,
     pub destination: Option<String>,
     pub transport: Option<CloneTransport>,
+}
+
+pub struct RepoNewRequest {
+    pub output: OutputFormat,
+    pub name: String,
+    pub description: Option<String>,
+    pub homepage: Option<String>,
+    pub private: bool,
+    pub auto_init: bool,
+}
+
+pub struct RepoDeleteRequest {
+    pub output: OutputFormat,
+    pub repo: String,
+    pub yes: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -457,6 +521,107 @@ fn prompt_for_clone_transport() -> Result<CloneTransport, CommandError> {
     CloneTransport::parse_choice(&input)
 }
 
+fn render_repo_new(output: OutputFormat, repository: &Repository) -> CommandOutcome {
+    match output {
+        OutputFormat::Json { fields } => CommandOutcome::json(
+            EXIT_OK,
+            match fields {
+                Some(fields) => repo_view_selected_json_struct(repository, &fields),
+                None => repo_new_json(repository),
+            },
+        ),
+        OutputFormat::Text => CommandOutcome::text(
+            EXIT_OK,
+            format!(
+                "Created repository {}\nhtml url: {}\nssh url: {}\nclone url: {}",
+                repository.full_name,
+                repository.html_url,
+                repository.ssh_url,
+                repository.clone_url,
+            ),
+        ),
+    }
+}
+
+fn render_repo_delete(output: OutputFormat, owner: &str, name: &str) -> CommandOutcome {
+    let full_name = format!("{owner}/{name}");
+    match output {
+        OutputFormat::Json { .. } => CommandOutcome::json(
+            EXIT_OK,
+            json!({
+                "owner": owner,
+                "name": name,
+                "full_name": full_name,
+                "deleted": true,
+            }),
+        ),
+        OutputFormat::Text => CommandOutcome::text(
+            EXIT_OK,
+            format!("Deleted repository {full_name}"),
+        ),
+    }
+}
+
+fn repo_new_json(repository: &Repository) -> serde_json::Value {
+    json!({
+        "owner": repository.owner,
+        "name": repository.name,
+        "full_name": repository.full_name,
+        "html_url": repository.html_url,
+        "ssh_url": repository.ssh_url,
+        "clone_url": repository.clone_url,
+        "default_branch": repository.default_branch,
+        "fork": repository.fork,
+    })
+}
+
+fn repo_view_selected_json_struct(repository: &Repository, fields: &[String]) -> serde_json::Value {
+    let mut selected = serde_json::Map::with_capacity(fields.len());
+
+    for field in fields {
+        let value = match field.as_str() {
+            "name" => json!(repository.name),
+            "nameWithOwner" => json!(repository.full_name),
+            "url" => json!(repository.html_url),
+            "defaultBranch" => json!(repository.default_branch),
+            "sshUrl" => json!(repository.ssh_url),
+            "cloneUrl" => json!(repository.clone_url),
+            "isFork" => json!(repository.fork),
+            _ => unreachable!("unsupported repository json field"),
+        };
+
+        selected.insert(field.clone(), value);
+    }
+
+    serde_json::Value::Object(selected)
+}
+
+fn prompt_for_repo_deletion_confirmation(
+    owner: &str,
+    name: &str,
+) -> Result<(), CommandError> {
+    let mut stderr = io::stderr();
+    write!(
+        stderr,
+        "Type \"{owner}/{name}\" to confirm deletion: "
+    )
+    .map_err(|err| CommandError::usage(format!("failed to write prompt: {err}")))?;
+    stderr
+        .flush()
+        .map_err(|err| CommandError::usage(format!("failed to write prompt: {err}")))?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| CommandError::usage(format!("failed to read confirmation: {err}")))?;
+
+    if input.trim() != format!("{owner}/{name}") {
+        return Err(CommandError::usage("deletion cancelled"));
+    }
+
+    Ok(())
+}
+
 fn map_repo_error(error: RepoError) -> CommandError {
     match error {
         RepoError::InvalidToken => CommandError {
@@ -474,6 +639,13 @@ fn map_repo_error(error: RepoError) -> CommandError {
             stdout: None,
             stderr: Some(format!(
                 "remote request returned unexpected status: {status}"
+            )),
+        },
+        RepoError::UnexpectedStatusWithMessage(status, message) => CommandError {
+            code: EXIT_REMOTE,
+            stdout: None,
+            stderr: Some(format!(
+                "remote request failed ({status}): {message}"
             )),
         },
         RepoError::NotFound => CommandError::not_found("repository not found"),
