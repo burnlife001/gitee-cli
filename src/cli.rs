@@ -13,7 +13,7 @@ use crate::pr::{
     PrCheckoutRequest, PrCommentRequest, PrCreateRequest, PrEditRequest, PrListRequest,
     PrMergeMethod, PrMergeRequest, PrService, PrStatusRequest, PrTextSource, PrViewRequest,
 };
-use crate::repo::{CloneTransport, RepoCloneRequest, RepoService, RepoViewRequest};
+use crate::repo::{CloneTransport, RepoCloneRequest, RepoDeleteRequest, RepoNewRequest, RepoService, RepoViewRequest};
 
 enum ParseOutcome<T> {
     Value(T),
@@ -84,7 +84,7 @@ fn json_field_selection_for_help(path: &str) -> Option<&'static [&'static str]> 
     match path {
         "pr view" | "pr create" | "pr edit" => Some(PR_DETAIL_JSON_FIELDS),
         "pr list" | "pr status" => Some(PR_SUMMARY_JSON_FIELDS),
-        "repo view" => Some(REPO_VIEW_JSON_FIELDS),
+        "repo new" | "repo view" => Some(REPO_VIEW_JSON_FIELDS),
         "issue view" => Some(ISSUE_DETAIL_JSON_FIELDS),
         "issue list" => Some(ISSUE_SUMMARY_JSON_FIELDS),
         _ => None,
@@ -198,6 +198,8 @@ fn run_repo(args: &[String]) -> Result<CommandOutcome, CommandError> {
 
     match subcommand.as_str() {
         "clone" => execute_parsed(parse_repo_clone_args(rest), |request| repo.clone(request)),
+        "del" => execute_parsed(parse_repo_del_args(rest), |request| repo.del_repo(request)),
+        "new" => execute_parsed(parse_repo_new_args(rest), |request| repo.new_repo(request)),
         "view" => execute_parsed(parse_repo_view_args(rest), |request| repo.view(request)),
         _ => Err(CommandError::usage("unsupported command")),
     }
@@ -310,6 +312,14 @@ fn resolve_help_topic(path: &[String]) -> Option<HelpTopic> {
         ["repo", "clone"] => Some(HelpTopic {
             text_command: repo_clone_command,
             json: repo_clone_help_json,
+        }),
+        ["repo", "del"] => Some(HelpTopic {
+            text_command: repo_del_command,
+            json: repo_del_help_json,
+        }),
+        ["repo", "new"] => Some(HelpTopic {
+            text_command: repo_new_command,
+            json: repo_new_help_json,
         }),
         ["repo", "view"] => Some(HelpTopic {
             text_command: repo_view_command,
@@ -605,6 +615,65 @@ fn parse_repo_clone_args(args: &[String]) -> Result<ParseOutcome<RepoCloneReques
             } else {
                 None
             },
+        })
+    })
+}
+
+fn parse_repo_new_args(args: &[String]) -> Result<ParseOutcome<RepoNewRequest>, CommandError> {
+    map_parsed(parse_matches(repo_new_command(), args), |matches| {
+        let output = output_format(&matches);
+        validate_json_field_selection(&output, "repo new", REPO_VIEW_JSON_FIELDS)?;
+        let name = last_value(&matches, "name");
+        let description = last_value(&matches, "description");
+        let homepage = last_value(&matches, "homepage");
+        let public_count = flag_count(&matches, "public");
+        let private_count = flag_count(&matches, "private");
+        let auto_init_count = flag_count(&matches, "auto_init");
+
+        if public_count + private_count > 1 {
+            return Err(CommandError::usage(
+                "provide only one of --public or --private",
+            ));
+        }
+
+        let Some(name) = name else {
+            return Err(CommandError::usage("repo new requires --name"));
+        };
+
+        Ok(RepoNewRequest {
+            output,
+            name,
+            description,
+            homepage,
+            private: private_count > 0 || public_count == 0,
+            auto_init: auto_init_count > 0,
+        })
+    })
+}
+
+fn parse_repo_del_args(args: &[String]) -> Result<ParseOutcome<RepoDeleteRequest>, CommandError> {
+    map_parsed(parse_matches(repo_del_command(), args), |matches| {
+        let output = output_format(&matches);
+        validate_json_field_selection(&output, "repo del", &[])?;
+        let yes_count = flag_count(&matches, "yes");
+        let positionals = values(&matches, "positionals");
+
+        let Some(repo) = positionals.first() else {
+            return Err(CommandError::usage(
+                "repo del requires an owner/repo slug",
+            ));
+        };
+
+        if positionals.len() > 1 {
+            return Err(CommandError::usage(
+                "repo del accepts exactly one owner/repo slug",
+            ));
+        }
+
+        Ok(RepoDeleteRequest {
+            output,
+            repo: repo.clone(),
+            yes: yes_count > 0,
         })
     })
 }
@@ -1124,8 +1193,10 @@ fn pr_help_command() -> Command {
 
 fn repo_help_command() -> Command {
     base_command("repo", "gitee repo")
-        .about("Inspect and clone repositories")
+        .about("Inspect, create, delete, and clone repositories")
         .subcommand(repo_clone_command())
+        .subcommand(repo_del_command())
+        .subcommand(repo_new_command())
         .subcommand(repo_view_command())
 }
 
@@ -1266,6 +1337,58 @@ fn pr_view_command() -> Command {
         .arg(json_flag())
         .arg(repo_option())
         .arg(positionals_arg("positionals", "PR", "Pull request number"))
+}
+
+fn repo_new_command() -> Command {
+    base_command("new", "gitee repo new")
+        .about("Create a new repository")
+        .after_help("Create a repository on Gitee.\n\
+            \n\
+            Example:\n  gitee repo new --name my-project --description \"My project\" --public --auto-init\n  gitee repo new --name my-project --private\n  gitee repo new --name my-project --json")
+        .arg(json_flag())
+        .arg(string_option("name", "name", "NAME", "Repository name"))
+        .arg(string_option(
+            "description",
+            "description",
+            "DESCRIPTION",
+            "Repository description",
+        ))
+        .arg(string_option(
+            "homepage",
+            "homepage",
+            "URL",
+            "Repository homepage URL",
+        ))
+        .arg(count_flag("public", "public", "Make the repository public"))
+        .arg(count_flag(
+            "private",
+            "private",
+            "Make the repository private (default)",
+        ))
+        .arg(count_flag(
+            "auto_init",
+            "auto-init",
+            "Initialize the repository with a README",
+        ))
+}
+
+fn repo_del_command() -> Command {
+    base_command("del", "gitee repo del")
+        .about("Delete a repository")
+        .after_help("Delete a repository on Gitee.\n\
+            \n\
+            Example:\n  gitee repo del owner/repo\n  gitee repo del owner/repo --yes      # skip confirmation\n  gitee repo del owner/repo --json")
+        .arg(json_flag())
+        .arg(count_flag(
+            "yes",
+            "yes",
+            "Skip the confirmation prompt",
+        ))
+        .arg(positionals_arg(
+            "positionals",
+            "OWNER/REPO",
+            "Repository slug to delete",
+        ))
 }
 
 fn repo_view_command() -> Command {
@@ -2225,9 +2348,98 @@ fn repo_help_json() -> serde_json::Value {
     help_group_json(
         "repo",
         "repo",
-        "Inspect and clone repositories",
+        "Inspect, create, delete, and clone repositories",
         "gh repo",
-        vec![repo_clone_help_json(), repo_view_help_json()],
+        vec![
+            repo_clone_help_json(),
+            repo_del_help_json(),
+            repo_new_help_json(),
+            repo_view_help_json(),
+        ],
+    )
+}
+
+fn repo_new_help_json() -> serde_json::Value {
+    help_command_json(
+        "new",
+        "repo new",
+        "Create a new repository",
+        "gh repo create",
+        true,
+        "required",
+        false,
+        false,
+        false,
+        vec![
+            help_option_json("--json", None, "Output machine-readable JSON", false),
+            help_option_json("--name", Some("NAME"), "Repository name", true),
+            help_option_json(
+                "--description",
+                Some("DESCRIPTION"),
+                "Repository description",
+                false,
+            ),
+            help_option_json(
+                "--homepage",
+                Some("URL"),
+                "Repository homepage URL",
+                false,
+            ),
+            help_option_json("--public", None, "Make the repository public", false),
+            help_option_json(
+                "--private",
+                None,
+                "Make the repository private (default)",
+                false,
+            ),
+            help_option_json(
+                "--auto-init",
+                None,
+                "Initialize the repository with a README",
+                false,
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+        vec![
+            "gitee repo new --name my-project --public --auto-init --json",
+            "gitee repo new --name my-project --description \"A new project\" --private --json",
+        ],
+        vec![
+            "--name is required.",
+            "The repository is private by default unless --public is provided.",
+            "Provide at most one of --public or --private.",
+        ],
+    )
+}
+
+fn repo_del_help_json() -> serde_json::Value {
+    help_command_json(
+        "del",
+        "repo del",
+        "Delete a repository",
+        "gh repo delete",
+        true,
+        "required",
+        false,
+        false,
+        false,
+        vec![
+            help_option_json("--json", None, "Output machine-readable JSON", false),
+            help_option_json("--yes", None, "Skip the confirmation prompt", false),
+        ],
+        vec![help_argument_json(
+            "repo",
+            "OWNER/REPO",
+            "Repository slug to delete",
+            true,
+        )],
+        Vec::new(),
+        vec![
+            "gitee repo del octo/demo --yes --json",
+            "gitee repo del octo/demo",
+        ],
+        vec!["You will be prompted to type the full owner/repo to confirm deletion unless --yes is provided."],
     )
 }
 
