@@ -909,7 +909,8 @@ struct RepositoryResponse {
     #[serde(default)]
     clone_url: Option<String>,
     fork: bool,
-    default_branch: String,
+    #[serde(default)]
+    default_branch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1037,7 +1038,7 @@ impl RepositoryResponse {
             ssh_url,
             clone_url,
             fork: self.fork,
-            default_branch: self.default_branch,
+            default_branch: self.default_branch.unwrap_or_default(),
         }
     }
 
